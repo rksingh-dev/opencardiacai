@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
     const file = formData.get('file') as File;
     if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 });
 
-    const buffer = await file.arrayBuffer();
+    const buffer = await file.arrayBuffer() as ArrayBuffer;
     const filename = file.name.toLowerCase();
 
     // ═══════════════════════════════════════════
@@ -31,9 +31,9 @@ export async function POST(req: NextRequest) {
     // Also handles 4D (cine) for Ejection Fraction
     // ═══════════════════════════════════════════
     if (filename.endsWith('.nii') || filename.endsWith('.nii.gz')) {
-      let niftiBuffer = buffer;
+      let niftiBuffer: ArrayBuffer = buffer;
       if (nifti.isCompressed(buffer)) {
-        niftiBuffer = nifti.decompress(buffer);
+        niftiBuffer = nifti.decompress(buffer) as ArrayBuffer;
       }
       if (!nifti.isNIFTI(niftiBuffer)) {
         throw new Error("Invalid NIfTI file format.");
@@ -96,7 +96,7 @@ export async function POST(req: NextRequest) {
     // ═══════════════════════════════════════
     // DICOM path: single 2D slice
     // ═══════════════════════════════════════
-    const dataView = new DataView(buffer);
+    const dataView = new DataView(buffer as ArrayBuffer);
     const image = daikon.Series.parseImage(dataView);
     if (!image) throw new Error("Could not parse DICOM image.");
 
