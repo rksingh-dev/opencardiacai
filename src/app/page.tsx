@@ -7,7 +7,6 @@ import {
   Eye, EyeOff, SlidersHorizontal, TrendingUp
 } from 'lucide-react';
 import * as ort from 'onnxruntime-web';
-import ThreeDViewer from '../components/ThreeDViewer';
 
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
 
@@ -334,9 +333,6 @@ export default function Home() {
   // Feature 6: Wall thickness
   const [wallThicknesses, setWallThicknesses] = useState<number[]>([]);
 
-  // 3D rendering state
-  const [threeDData, setThreeDData] = useState<{ points: Float32Array, colors: Float32Array } | null>(null);
-
   const fileInputRef = useRef<HTMLInputElement>(null);
   const canvasRef    = useRef<HTMLCanvasElement>(null);
 
@@ -374,7 +370,6 @@ export default function Home() {
     setWindowLevel(128); setWindowWidth(255); setShowConfidence(false);
     setLvAreaCurve([]); setDiastoleIdx(-1); setSystoleIdx(-1);
     setWallThicknesses([]); setEfProgress(0); clearCanvas();
-    setThreeDData(null);
   };
 
   const loadFile = async (file: File) => {
@@ -414,7 +409,6 @@ export default function Home() {
     setMaskDataUrl(null); setConfidenceMapUrl(null);
     setMetrics(null); setWallThicknesses([]); setShowConfidence(false);
     clearCanvas(); setStatus('idle');
-    setThreeDData(null);
   };
 
   // Features 1+2+6: Segment current slice (with multi-slice averaging)
@@ -498,72 +492,6 @@ export default function Home() {
         diagnosis, myoLvRatio: ratio, ejectionFraction: ef,
         lvVolMl: toMl(result.lvCount), myoVolMl: toMl(result.myoCount), rvVolMl: toMl(result.rvCount),
       });
-      setStatus('success');
-    } catch (err) { console.error(err); setStatus('idle'); }
-  };
-
-  // Feature: 3D Point Cloud Generator
-  const generate3DModel = async () => {
-    if (!session || !allSlices.length || !sliceMeta) return;
-    setStatus('computing_ef'); // reusing progress indicator
-    setEfProgress(0);
-    setThreeDData(null);
-    
-    const T = 224, TT = T * T;
-    const pts: number[] = [];
-    const cls: number[] = []; // colors (r,g,b)
-    
-    const scaleX = pixdim[0] || 1;
-    const scaleY = pixdim[1] || 1;
-    const scaleZ = pixdim[2] || 1;
-
-    try {
-      for (let s = 0; s < allSlices.length; s++) {
-        const url = rawB64ToDataUrl(allSlices[s], sliceMeta.cols, sliceMeta.rows);
-        const img = new Image();
-        await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = rej; img.src = url; });
-        const hc = document.createElement('canvas'); hc.width = T; hc.height = T;
-        const hctx = hc.getContext('2d', { willReadFrequently: true })!;
-        hctx.drawImage(img, 0, 0, T, T);
-        const raw = hctx.getImageData(0, 0, T, T).data;
-        const float = new Float32Array(TT);
-        let sum = 0;
-        for (let i = 0; i < TT; i++) {
-          const g = (raw[i*4]*0.299 + raw[i*4+1]*0.587 + raw[i*4+2]*0.114) / 255;
-          float[i] = g; sum += g;
-        }
-        const mean = sum / TT; let vv = 0; float.forEach(x => vv += (x - mean) ** 2);
-        const std = Math.sqrt(vv / TT) || 1;
-        for (let i = 0; i < TT; i++) float[i] = (float[i] - mean) / std;
-        
-        const tensor = new ort.Tensor('float32', float, [1, 1, T, T]);
-        const out = (await session.run({ [session.inputNames[0]]: tensor }))[session.outputNames[0]];
-        const outData = out.data as Float32Array;
-        
-        let isNHWC = false, nc = 4;
-        if (out.dims.length === 4) { if (out.dims[3] <= 10) { isNHWC = true; nc = out.dims[3]; } else nc = out.dims[1]; }
-        
-        const COLORS = [[0,0,0], [59/255, 130/255, 246/255], [16/255, 185/255, 129/255], [239/255, 68/255, 68/255]];
-        
-        for (let y = 0; y < T; y++) {
-          for (let x = 0; x < T; x++) {
-             let px = y * T + x;
-             let clsIdx = 0, mx = -Infinity;
-             for (let c = 0; c < nc; c++) {
-               const v = isNHWC ? outData[px*nc+c] : outData[c*TT+px];
-               if (v > mx) { mx = v; clsIdx = c; }
-             }
-             if (clsIdx > 0 && x % 2 === 0 && y % 2 === 0) {
-               pts.push((x - T/2) * scaleX, (y - T/2) * scaleY, (s - allSlices.length/2) * scaleZ);
-               cls.push(COLORS[clsIdx][0], COLORS[clsIdx][1], COLORS[clsIdx][2]);
-             }
-          }
-        }
-        setEfProgress(Math.round(((s + 1) / allSlices.length) * 100));
-        await new Promise(r => setTimeout(r, 10)); // yield
-      }
-      
-      setThreeDData({ points: new Float32Array(pts), colors: new Float32Array(cls) });
       setStatus('success');
     } catch (err) { console.error(err); setStatus('idle'); }
   };
@@ -720,14 +648,6 @@ export default function Home() {
                   disabled={status === 'processing' || status === 'computing_ef' || !engineReady}>
                   <FileHeart size={14} />
                   {status === 'computing_ef' ? `EF: ${efProgress}%` : 'Compute Ejection Fraction'}
-                </button>
-              )}
-
-              {fileMode === '3d_volume' && allSlices.length > 1 && (
-                <button className="btn btn-upload" style={{ marginTop: '0.5rem' }} onClick={generate3DModel}
-                  disabled={status === 'processing' || status === 'computing_ef' || !engineReady}>
-                  <Layers size={14} />
-                  {status === 'computing_ef' ? `Building 3D: ${efProgress}%` : 'Generate 3D Heart (Points)'}
                 </button>
               )}
 
@@ -913,17 +833,6 @@ export default function Home() {
               <div style={{ background: 'var(--bg-surface)', border: '1px solid var(--border-subtle)', padding: '1.25rem' }}>
                 <WallThicknessChart thicknesses={wallThicknesses} pixdim={pixdim} />
               </div>
-            </div>
-          )}
-
-          {/* 3D Viewer */}
-          {threeDData && (
-            <div style={{ marginTop: '1.5rem', width: '100%', maxWidth: 700 }}>
-              <h3 style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: '0.5rem' }}>
-                <Layers size={13} style={{ display: 'inline', verticalAlign: 'middle', marginRight: '4px' }}/>
-                Interactive 3D Point Cloud Volume
-              </h3>
-              <ThreeDViewer points={threeDData.points} colors={threeDData.colors} />
             </div>
           )}
         </main>
