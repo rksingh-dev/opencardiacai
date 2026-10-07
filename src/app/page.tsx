@@ -7,6 +7,7 @@ import {
   Eye, EyeOff, SlidersHorizontal, TrendingUp
 } from 'lucide-react';
 import * as ort from 'onnxruntime-web';
+import * as nifti from 'nifti-reader-js';
 
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/";
 
@@ -21,6 +22,29 @@ interface Diagnostics {
   lvVolMl?: number; myoVolMl?: number; rvVolMl?: number;
 }
 interface SliceMeta { cols: number; rows: number; sliceCount: number; }
+
+function uint8ToBase64(u8Arr: Uint8Array): string {
+  let binary = '';
+  const len = u8Arr.byteLength;
+  for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(u8Arr[i]);
+  }
+  return window.btoa(binary);
+}
+
+function normalizeToUint8(pixels: ArrayLike<number>): Uint8Array {
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < pixels.length; i++) {
+    if (pixels[i] < min) min = pixels[i];
+    if (pixels[i] > max) max = pixels[i];
+  }
+  const range = max - min || 1;
+  const out = new Uint8Array(pixels.length);
+  for (let i = 0; i < pixels.length; i++) {
+    out[i] = ((pixels[i] - min) / range) * 255;
+  }
+  return out;
+}
 
 // ── Feature 3: Windowing ───────────────────────────────────
 // Applies WW/WL windowing to raw single-channel uint8 b64 bytes
@@ -376,7 +400,76 @@ export default function Home() {
     resetState();
     const fname = file.name.toLowerCase();
 
-    if (fname.endsWith('.dcm') || fname.endsWith('.nii') || fname.endsWith('.nii.gz')) {
+    if (fname.endsWith('.nii') || fname.endsWith('.nii.gz')) {
+      setStatus('processing');
+      try {
+        const buffer = await file.arrayBuffer();
+        let niftiBuffer: ArrayBuffer = buffer;
+        if (nifti.isCompressed(buffer)) {
+          niftiBuffer = nifti.decompress(buffer) as ArrayBuffer;
+        }
+        if (!nifti.isNIFTI(niftiBuffer)) {
+          throw new Error("Invalid NIfTI file format.");
+        }
+
+        const niftiHeader = nifti.readHeader(niftiBuffer);
+        const niftiImage = nifti.readImage(niftiHeader, niftiBuffer);
+
+        const cols = niftiHeader.dims[1];
+        const rows = niftiHeader.dims[2];
+        const slices = niftiHeader.dims[3] || 1;
+        const timeFrames = niftiHeader.dims[4] || 1;
+
+        const pd = [
+          Math.abs(niftiHeader.pixDims[1]) || 1,
+          Math.abs(niftiHeader.pixDims[2]) || 1,
+          Math.abs(niftiHeader.pixDims[3]) || 1,
+        ];
+
+        let typedData: ArrayLike<number>;
+        if (niftiHeader.datatypeCode === nifti.NIFTI1.TYPE_UINT8)    typedData = new Uint8Array(niftiImage as ArrayBuffer);
+        else if (niftiHeader.datatypeCode === nifti.NIFTI1.TYPE_INT16)   typedData = new Int16Array(niftiImage as ArrayBuffer);
+        else if (niftiHeader.datatypeCode === nifti.NIFTI1.TYPE_INT32)   typedData = new Int32Array(niftiImage as ArrayBuffer);
+        else if (niftiHeader.datatypeCode === nifti.NIFTI1.TYPE_FLOAT32) typedData = new Float32Array(niftiImage as ArrayBuffer);
+        else if (niftiHeader.datatypeCode === nifti.NIFTI1.TYPE_FLOAT64) typedData = new Float64Array(niftiImage as ArrayBuffer);
+        else throw new Error("Unsupported NIfTI datatype: " + niftiHeader.datatypeCode);
+
+        const sliceSize = cols * rows;
+        const is4D = timeFrames > 1;
+        const allSlicesB64: string[] = [];
+
+        if (is4D) {
+          const midSlice = Math.floor(slices / 2);
+          for (let t = 0; t < timeFrames; t++) {
+            const offset = (t * slices * sliceSize) + (midSlice * sliceSize);
+            const raw = Array.from({ length: sliceSize }, (_, i) => (typedData as any)[offset + i]);
+            allSlicesB64.push(uint8ToBase64(normalizeToUint8(raw)));
+          }
+          setSliceMeta({ cols, rows, sliceCount: timeFrames });
+          setFileMode('4d_cine');
+          setAllSlices(allSlicesB64);
+        } else {
+          for (let s = 0; s < slices; s++) {
+            const raw = Array.from({ length: sliceSize }, (_, i) => (typedData as any)[s * sliceSize + i]);
+            allSlicesB64.push(uint8ToBase64(normalizeToUint8(raw)));
+          }
+          setSliceMeta({ cols, rows, sliceCount: slices });
+          setFileMode('3d_volume');
+          setAllSlices(allSlicesB64);
+        }
+
+        setPixdim(pd);
+        const mid = Math.floor((is4D ? timeFrames : slices) / 2);
+        setCurrentSlice(mid);
+        setSelectedImage(applyWindowingToB64(allSlicesB64[mid], cols, rows, 128, 255));
+        setStatus('idle');
+      } catch (err) {
+        console.error(err); alert("Failed to parse NIfTI image."); setStatus('idle');
+      }
+      return;
+    }
+
+    if (fname.endsWith('.dcm')) {
       setStatus('processing');
       const form = new FormData(); form.append('file', file);
       try {
@@ -392,7 +485,7 @@ export default function Home() {
         setCurrentSlice(mid);
         setSelectedImage(applyWindowingToB64(slices[mid], cols, rows, 128, 255));
         setStatus('idle');
-      } catch (err) { console.error(err); alert("Failed to parse medical image."); setStatus('idle'); }
+      } catch (err) { console.error(err); alert("Failed to parse DICOM image."); setStatus('idle'); }
       return;
     }
 
