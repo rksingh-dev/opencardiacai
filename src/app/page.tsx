@@ -46,27 +46,20 @@ function normalizeToUint8(pixels: ArrayLike<number>): Uint8Array {
   return out;
 }
 
-// ── Feature 3: Windowing ───────────────────────────────────
-// Applies WW/WL windowing to raw single-channel uint8 b64 bytes
-function applyWindowingToB64(b64: string, cols: number, rows: number, wl: number, ww: number): string {
+// Converts raw single-channel uint8 b64 bytes to dataUrl
+function rawB64ToDataUrl(b64: string, cols: number, rows: number): string {
   const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
   const canvas = document.createElement('canvas');
   canvas.width = cols; canvas.height = rows;
   const ctx = canvas.getContext('2d')!;
   const imgData = ctx.createImageData(cols, rows);
-  const low = wl - ww / 2;
   for (let i = 0; i < bytes.length; i++) {
-    let v = bytes[i] <= low ? 0 : bytes[i] >= low + ww ? 255 : ((bytes[i] - low) / ww) * 255;
+    const v = bytes[i];
     const idx = i * 4;
     imgData.data[idx] = v; imgData.data[idx+1] = v; imgData.data[idx+2] = v; imgData.data[idx+3] = 255;
   }
   ctx.putImageData(imgData, 0, 0);
   return canvas.toDataURL('image/png');
-}
-
-// Converts raw b64 bytes to full-range dataURL (for inference - no windowing)
-function rawB64ToDataUrl(b64: string, cols: number, rows: number): string {
-  return applyWindowingToB64(b64, cols, rows, 128, 255);
 }
 
 // ── Feature 1: Confidence color map ───────────────────────
@@ -212,10 +205,13 @@ async function segmentDataUrls(
       const g = (raw[i*4]*0.299 + raw[i*4+1]*0.587 + raw[i*4+2]*0.114) / 255;
       float[i] = g; sum += g;
     }
-    const mean = sum / TT;
-    let v = 0; float.forEach(x => v += (x - mean) ** 2);
-    const std = Math.sqrt(v / TT) || 1;
-    for (let i = 0; i < TT; i++) float[i] = (float[i] - mean) / std;
+    // Standard PyTorch timm-tf_efficientnet preprocessing is usually (x - 0.5) / 0.5 
+    // or standard ImageNet (x - 0.456) / 0.224. 
+    // Often for grayscale, they just use (x - 0.5) / 0.5 or leave it as 0-1.
+    // We will use (g - 0.5) / 0.5 which maps [0, 1] to [-1, 1] (Standard TF EfficientNet).
+    for (let i = 0; i < TT; i++) {
+      float[i] = (float[i] - 0.5) / 0.5;
+    }
 
     const tensor = new ort.Tensor('float32', float, [1, 1, T, T]);
     const out = (await session.run({ [session.inputNames[0]]: tensor }))[session.outputNames[0]];
@@ -290,9 +286,8 @@ async function countLV(dataUrl: string, session: ort.InferenceSession): Promise<
     const g = (raw[i*4]*0.299 + raw[i*4+1]*0.587 + raw[i*4+2]*0.114) / 255;
     float[i] = g; sum += g;
   }
-  const mean = sum / TT; let vv = 0; float.forEach(x => vv += (x - mean) ** 2);
-  const std = Math.sqrt(vv / TT) || 1;
-  for (let i = 0; i < TT; i++) float[i] = (float[i] - mean) / std;
+  // Apply the exact same normalization here
+  for (let i = 0; i < TT; i++) float[i] = (float[i] - 0.5) / 0.5;
   const tensor = new ort.Tensor('float32', float, [1, 1, T, T]);
   const out = (await session.run({ [session.inputNames[0]]: tensor }))[session.outputNames[0]];
   const outData = out.data as Float32Array;
@@ -339,9 +334,6 @@ export default function Home() {
   const [fileMode, setFileMode]       = useState<FileMode>('image');
   const [pixdim, setPixdim]           = useState<number[]>([1, 1, 1]);
 
-  // Feature 3: Windowing
-  const [windowLevel, setWindowLevel] = useState(128);
-  const [windowWidth, setWindowWidth] = useState(255);
 
   // Feature 1: Confidence toggle
   const [showConfidence, setShowConfidence]     = useState(false);
@@ -366,13 +358,6 @@ export default function Home() {
       .catch(e => console.error("Model load error:", e));
   }, []);
 
-  // Feature 3: Re-apply windowing when sliders change
-  useEffect(() => {
-    if (allSlices.length > 0 && sliceMeta) {
-      setSelectedImage(applyWindowingToB64(allSlices[currentSlice], sliceMeta.cols, sliceMeta.rows, windowLevel, windowWidth));
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [windowLevel, windowWidth]);
 
   const clearCanvas = () => {
     if (canvasRef.current) {
@@ -391,7 +376,7 @@ export default function Home() {
     setSelectedImage(null); setMaskDataUrl(null); setConfidenceMapUrl(null);
     setStatus("idle"); setMetrics(null); setAllSlices([]); setSliceMeta(null);
     setCurrentSlice(0); setFileMode('image'); setPixdim([1,1,1]);
-    setWindowLevel(128); setWindowWidth(255); setShowConfidence(false);
+    setShowConfidence(false);
     setLvAreaCurve([]); setDiastoleIdx(-1); setSystoleIdx(-1);
     setWallThicknesses([]); setEfProgress(0); clearCanvas();
   };
@@ -461,7 +446,7 @@ export default function Home() {
         setPixdim(pd);
         const mid = Math.floor((is4D ? timeFrames : slices) / 2);
         setCurrentSlice(mid);
-        setSelectedImage(applyWindowingToB64(allSlicesB64[mid], cols, rows, 128, 255));
+        setSelectedImage(rawB64ToDataUrl(allSlicesB64[mid], cols, rows));
         setStatus('idle');
       } catch (err) {
         console.error(err); alert("Failed to parse NIfTI image."); setStatus('idle');
@@ -483,7 +468,7 @@ export default function Home() {
         if (pd) setPixdim(pd);
         const mid = Math.floor(sliceCount / 2);
         setCurrentSlice(mid);
-        setSelectedImage(applyWindowingToB64(slices[mid], cols, rows, 128, 255));
+        setSelectedImage(rawB64ToDataUrl(slices[mid], cols, rows));
         setStatus('idle');
       } catch (err) { console.error(err); alert("Failed to parse DICOM image."); setStatus('idle'); }
       return;
@@ -498,7 +483,7 @@ export default function Home() {
   const onSliceChange = (idx: number) => {
     if (!sliceMeta || !allSlices.length) return;
     setCurrentSlice(idx);
-    setSelectedImage(applyWindowingToB64(allSlices[idx], sliceMeta.cols, sliceMeta.rows, windowLevel, windowWidth));
+    setSelectedImage(rawB64ToDataUrl(allSlices[idx], sliceMeta.cols, sliceMeta.rows));
     setMaskDataUrl(null); setConfidenceMapUrl(null);
     setMetrics(null); setWallThicknesses([]); setShowConfidence(false);
     clearCanvas(); setStatus('idle');
@@ -568,7 +553,7 @@ export default function Home() {
       const url = rawB64ToDataUrl(allSlices[dIdx], sliceMeta.cols, sliceMeta.rows);
       const result = await segmentDataUrls([url], session);
       setCurrentSlice(dIdx);
-      setSelectedImage(applyWindowingToB64(allSlices[dIdx], sliceMeta.cols, sliceMeta.rows, windowLevel, windowWidth));
+      setSelectedImage(url);
       setMaskDataUrl(result.maskDataUrl);
       setConfidenceMapUrl(result.confidenceMapUrl);
       setWallThicknesses(result.wallThicknesses);
@@ -606,7 +591,7 @@ export default function Home() {
     // Images
     if (selectedImage) {
       doc.setTextColor(0,0,0); doc.setFontSize(9); doc.setFont('helvetica','bold');
-      doc.text(`MRI SCAN (WL:${windowLevel} WW:${windowWidth})`, 15, 42);
+      doc.text(`MRI SCAN`, 15, 42);
       doc.addImage(selectedImage, 'PNG', 15, 46, 78, 78);
     }
     if (canvasRef.current) {
@@ -694,24 +679,7 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Feature 3: Windowing */}
-          {allSlices.length > 0 && (
-            <div className="sidebar-section fade-in">
-              <h2 className="section-title"><SlidersHorizontal size={14} /> Windowing (WW/WL)</h2>
-              <div className="info-row" style={{ marginBottom: '0.3rem' }}>
-                <span className="info-label">Level (WL)</span>
-                <span className="info-value">{windowLevel}</span>
-              </div>
-              <input type="range" min={0} max={255} value={windowLevel}
-                onChange={e => setWindowLevel(Number(e.target.value))} className="slice-slider" />
-              <div className="info-row" style={{ marginTop: '0.7rem', marginBottom: '0.3rem' }}>
-                <span className="info-label">Width (WW)</span>
-                <span className="info-value">{windowWidth}</span>
-              </div>
-              <input type="range" min={10} max={255} value={windowWidth}
-                onChange={e => setWindowWidth(Number(e.target.value))} className="slice-slider" />
-            </div>
-          )}
+
 
           {/* Analysis controls */}
           {selectedImage && (
