@@ -16,16 +16,5 @@ OpenCardiac AI is a browser-based clinical tool that uses an ONNX-exported U-Net
   - AI confidence heatmaps and multi-slice averaging.
 - **Export:** One-click PDF report generation.
 
-## 🚀 Quick Start
 
-```bash
-git clone https://github.com/rksingh-dev/opencardiacai.git
-cd opencardiacai
-npm install
-npm run dev
-```
-
-Open [http://localhost:3000](http://localhost:3000) in your browser.
-
----
 *Disclaimer: For research and educational purposes only. Not a medical device.*
