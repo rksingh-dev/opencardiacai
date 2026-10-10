@@ -328,12 +328,18 @@ def run_inference(engine, input_tensor):
 def compute_clinical_metrics(mask, pixel_spacing=(1.4, 1.4)):
     """
     Compute cardiac morphological parameters and clinical impressions.
+    Anatomical mapping:
+    - 0: Background
+    - 1: Right Ventricle (RV cavity / crescent)
+    - 2: Myocardium (MYO muscle wall)
+    - 3: Left Ventricle (LV cavity / blood pool)
     """
     area_per_pixel_mm2 = pixel_spacing[0] * pixel_spacing[1]
 
-    lv_pixels = int(np.sum(mask == 1))
+    # Anatomical class counts
+    rv_pixels = int(np.sum(mask == 1))
     myo_pixels = int(np.sum(mask == 2))
-    rv_pixels = int(np.sum(mask == 3))
+    lv_pixels = int(np.sum(mask == 3))
 
     lv_area_cm2 = (lv_pixels * area_per_pixel_mm2) / 100.0
     myo_area_cm2 = (myo_pixels * area_per_pixel_mm2) / 100.0
@@ -341,7 +347,7 @@ def compute_clinical_metrics(mask, pixel_spacing=(1.4, 1.4)):
 
     myo_lv_ratio = (myo_pixels / lv_pixels) if lv_pixels > 0 else 0.0
 
-    if lv_pixels == 0:
+    if lv_pixels == 0 and myo_pixels == 0:
         diagnosis = "No Cardiac Structures Detected in Slice"
         status_color = "gray"
     elif myo_lv_ratio > 1.8:
@@ -372,10 +378,15 @@ def compute_clinical_metrics(mask, pixel_spacing=(1.4, 1.4)):
 def compute_12_sector_wall_thickness(mask, pixel_spacing=(1.4, 1.4)):
     """
     Calculates average myocardial wall thickness across 12 clock sectors (30 deg each).
+    Center is calculated from the Left Ventricle cavity (Class 3), measuring outward
+    through the Myocardium ring (Class 2) per AHA standard.
     """
-    lv_pts = np.argwhere(mask == 1)
+    lv_pts = np.argwhere(mask == 3)
     if len(lv_pts) < 10:
-        return [0.0] * 12
+        # Fallback to class 1 if class 3 is empty
+        lv_pts = np.argwhere(mask == 1)
+        if len(lv_pts) < 10:
+            return [0.0] * 12
 
     center_y, center_x = np.mean(lv_pts, axis=0)
 
@@ -402,28 +413,182 @@ def compute_12_sector_wall_thickness(mask, pixel_spacing=(1.4, 1.4)):
 
     return sector_thicknesses
 
-def create_color_overlay(base_img_224, mask, alpha=0.55):
+def get_color_scheme(palette="classic"):
     """
-    Generate an RGB image with color-coded segmentation mask overlay.
-    - Left Ventricle (LV, 1): Red [239, 68, 68]
-    - Myocardium (MYO, 2): Emerald [16, 185, 129]
-    - Right Ventricle (RV, 3): Electric Blue [59, 130, 246]
+    Color mappings and high-luminance edge contour colors.
+    """
+    if palette == "cardiac":
+        # Hemodynamic oxygenation convention (LV Red, MYO Green, RV Blue)
+        fill_colors = {
+            1: np.array([59/255.0, 130/255.0, 246/255.0]),   # RV (Blue)
+            2: np.array([16/255.0, 185/255.0, 129/255.0]),   # MYO (Green)
+            3: np.array([239/255.0, 68/255.0, 68/255.0]),    # LV (Red)
+        }
+        contour_colors = {
+            1: np.array([191/255.0, 219/255.0, 254/255.0]),  # Light sky
+            2: np.array([167/255.0, 243/255.0, 208/255.0]),  # Light mint
+            3: np.array([254/255.0, 202/255.0, 202/255.0]),  # Light coral
+        }
+    elif palette == "neon":
+        # Radiology neon high-contrast palette
+        fill_colors = {
+            1: np.array([236/255.0, 72/255.0, 153/255.0]),   # RV (Neon Magenta)
+            2: np.array([16/255.0, 185/255.0, 129/255.0]),   # MYO (Emerald Green)
+            3: np.array([6/255.0, 182/255.0, 212/255.0]),    # LV (Cyan)
+        }
+        contour_colors = {
+            1: np.array([244/255.0, 114/255.0, 182/255.0]),  # Bright magenta
+            2: np.array([52/255.0, 211/255.0, 153/255.0]),   # Bright mint
+            3: np.array([103/255.0, 232/255.0, 249/255.0]),  # Bright cyan
+        }
+    else:
+        # Classic Clinical (RV Red crescent, MYO Green ring, LV Blue cavity)
+        fill_colors = {
+            1: np.array([239/255.0, 68/255.0, 68/255.0]),    # RV (Red)
+            2: np.array([16/255.0, 185/255.0, 129/255.0]),   # MYO (Green)
+            3: np.array([59/255.0, 130/255.0, 246/255.0]),   # LV (Blue)
+        }
+        contour_colors = {
+            1: np.array([254/255.0, 202/255.0, 202/255.0]),  # Light red edge
+            2: np.array([167/255.0, 243/255.0, 208/255.0]),  # Light mint edge
+            3: np.array([191/255.0, 219/255.0, 254/255.0]),  # Light blue edge
+        }
+    return fill_colors, contour_colors
+
+def create_color_overlay(base_img_224, mask, alpha=0.55, palette="classic"):
+    """
+    Generate standard 224x224 RGB image with segmentation mask overlay.
     """
     base_rgb = np.stack([base_img_224, base_img_224, base_img_224], axis=-1)
     overlay_rgb = base_rgb.copy()
+    fill_colors, _ = get_color_scheme(palette)
 
-    colors = {
-        1: np.array([239/255.0, 68/255.0, 68/255.0]),
-        2: np.array([16/255.0, 185/255.0, 129/255.0]),
-        3: np.array([59/255.0, 130/255.0, 246/255.0]),
-    }
-
-    for class_id, color in colors.items():
+    for class_id, color in fill_colors.items():
         idx = (mask == class_id)
         if np.any(idx):
             overlay_rgb[idx] = (1 - alpha) * base_rgb[idx] + alpha * color
 
     return np.clip(overlay_rgb, 0.0, 1.0)
+
+def create_high_res_color_overlay(
+    base_img_orig,
+    probs_224,
+    alpha=0.52,
+    target_size=(896, 896),
+    active_classes=(1, 2, 3),
+    draw_contours=True,
+    contour_width=2,
+    enhance_contrast=True,
+    contrast_factor=1.20,
+    sharpness_factor=1.30,
+    palette="classic"
+):
+    """
+    Generates an ultra-sharp, anti-aliased, high-definition segmentation overlay:
+    1. Continuous Sub-Pixel Probability Upsampling:
+       Upsamples float32 probabilities from 224x224 via bicubic interpolation,
+       producing organic, perfectly curved boundaries with zero stair-step pixelation.
+    2. Morphological Edge & Corner Refinement:
+       Applies morphological closing to fill corner notches and bridge thin edge dropouts.
+    3. Razor-Sharp Boundary Contours:
+       Extracts crisp 1.5–2px boundary lines around anatomical structures with bright highlights.
+    4. Enhanced Base CMRI Scan:
+       Scales the original CMRI slice using Lanczos resampling and subtle medical contrast
+       enhancement for maximum tissue clarity.
+    """
+    import torch
+    import torch.nn.functional as F
+    from PIL import ImageEnhance
+
+    # 1. Determine target resolution (minimum 896x896 or native size)
+    orig_arr = np.array(base_img_orig, dtype=np.float32)
+    if orig_arr.ndim > 2:
+        orig_arr = orig_arr.squeeze()
+        if orig_arr.ndim > 2:
+            orig_arr = orig_arr.mean(axis=-1)
+
+    orig_h, orig_w = orig_arr.shape
+    tgt_h = max(target_size[0], orig_h)
+    tgt_w = max(target_size[1], orig_w)
+
+    # 2. Continuous Sub-Pixel Bicubic Interpolation on Probabilities
+    probs_t = torch.from_numpy(probs_224).unsqueeze(0).float() # (1, 4, 224, 224)
+    probs_high = F.interpolate(probs_t, size=(tgt_h, tgt_w), mode='bicubic', align_corners=False)
+    mask_high = torch.argmax(probs_high, dim=1).squeeze(0) # (tgt_h, tgt_w)
+
+    # 3. Morphological Edge Closing & Corner Dropout Bridge
+    # Kernel size 5 with padding 2 ensures complete corner coverage
+    mask_refined = mask_high.clone()
+    for c in [1, 2, 3]:
+        if c not in active_classes:
+            continue
+        m_c = (mask_high == c).float().unsqueeze(0).unsqueeze(0)
+        dilated = F.max_pool2d(m_c, kernel_size=5, stride=1, padding=2)
+        closed = -F.max_pool2d(-dilated, kernel_size=5, stride=1, padding=2)
+        prob_c = probs_high[0, c, :, :].unsqueeze(0).unsqueeze(0)
+        # Seal corners and edge gaps where probability is reasonably confident
+        valid_fill = (closed > 0.5) & (prob_c > 0.18)
+        mask_refined[valid_fill.squeeze(0).squeeze(0)] = c
+
+    # Filter out inactive classes
+    for c in [1, 2, 3]:
+        if c not in active_classes:
+            mask_refined[mask_refined == c] = 0
+
+    # 4. Prepare High-Definition Base CMRI Scan
+    min_v = np.min(orig_arr)
+    max_v = np.max(orig_arr)
+    if max_v > min_v:
+        norm_orig = (orig_arr - min_v) / (max_v - min_v)
+    else:
+        norm_orig = np.zeros_like(orig_arr)
+
+    base_pil = Image.fromarray((norm_orig * 255.0).astype(np.uint8)).resize((tgt_w, tgt_h), Image.Resampling.LANCZOS)
+    if enhance_contrast:
+        base_pil = ImageEnhance.Contrast(base_pil).enhance(contrast_factor)
+        base_pil = ImageEnhance.Sharpness(base_pil).enhance(sharpness_factor)
+
+    base_norm = np.array(base_pil, dtype=np.float32) / 255.0
+    base_rgb = np.stack([base_norm, base_norm, base_norm], axis=-1)
+
+    # 5. Composite Translucent Color Overlay + Sharp Contour Outlines
+    composite = base_rgb.copy()
+    fill_colors, contour_colors = get_color_scheme(palette)
+
+    # Translucent anatomical wash
+    for c in active_classes:
+        idx = (mask_refined == c).numpy()
+        if np.any(idx):
+            color = fill_colors.get(c, np.array([1.0, 1.0, 1.0]))
+            composite[idx] = (1 - alpha) * composite[idx] + alpha * color
+
+    # Crisp boundary contour outlines
+    contour_mask_combined = np.zeros((tgt_h, tgt_w), dtype=np.uint8)
+    if draw_contours:
+        mask_ref_t = mask_refined.unsqueeze(0).unsqueeze(0).float()
+        k_size = 3 if contour_width == 1 else (5 if contour_width == 2 else 7)
+        pad = k_size // 2
+
+        for c in active_classes:
+            m_c = (mask_ref_t == c).float()
+            dilated = F.max_pool2d(m_c, kernel_size=k_size, stride=1, padding=pad)
+            eroded = -F.max_pool2d(-m_c, kernel_size=3, stride=1, padding=1)
+            boundary = ((dilated - eroded) > 0.5).squeeze().numpy()
+            if np.any(boundary):
+                composite[boundary] = contour_colors.get(c, np.array([1.0, 1.0, 1.0]))
+                contour_mask_combined[boundary] = c
+
+    composite_clamped = np.clip(composite, 0.0, 1.0)
+    base_rgb_clamped = np.clip(base_rgb, 0.0, 1.0)
+
+    return {
+        "composite_rgb": composite_clamped,
+        "base_rgb": base_rgb_clamped,
+        "mask_high": mask_refined.numpy().astype(np.uint8),
+        "composite_uint8": (composite_clamped * 255).astype(np.uint8),
+        "base_uint8": (base_rgb_clamped * 255).astype(np.uint8),
+        "contour_mask": contour_mask_combined
+    }
 
 def array_to_png_bytes(arr_uint8):
     """Encodes a uint8 numpy array to PNG bytes in memory."""
@@ -432,43 +597,52 @@ def array_to_png_bytes(arr_uint8):
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-def generate_segmentation_package(raw_norm_224, mask, metrics, alpha=0.55):
+def generate_segmentation_package(raw_norm_224, mask, metrics, alpha=0.55, high_res_overlay_uint8=None, high_res_mask=None, palette="classic"):
     """
-    Builds a complete exportable package:
-    - mask_png: indexed mask PNG (0, 1, 2, 3)
-    - overlay_png: RGB color overlay PNG
-    - lv_mask_png: binary LV cavity mask PNG (0 or 255)
-    - myo_mask_png: binary Myocardium mask PNG (0 or 255)
-    - rv_mask_png: binary RV cavity mask PNG (0 or 255)
+    Builds a complete exportable package with both standard and ultra-sharp HD outputs:
+    - overlay_png: RGB color overlay PNG (standard 224 and HD if provided)
+    - mask_png: indexed and colored mask PNGs
+    - lv_mask_png: binary LV cavity mask
+    - myo_mask_png: binary Myocardium mask
+    - rv_mask_png: binary RV cavity mask
     - zip_bytes: packaged ZIP containing all files + JSON report
     """
     # 1. Overlay
-    overlay_rgb = create_color_overlay(raw_norm_224, mask, alpha=alpha)
-    overlay_uint8 = (overlay_rgb * 255).astype(np.uint8)
-    overlay_bytes = array_to_png_bytes(overlay_uint8)
+    if high_res_overlay_uint8 is not None:
+        overlay_bytes = array_to_png_bytes(high_res_overlay_uint8)
+    else:
+        overlay_rgb = create_color_overlay(raw_norm_224, mask, alpha=alpha, palette=palette)
+        overlay_uint8 = (overlay_rgb * 255).astype(np.uint8)
+        overlay_bytes = array_to_png_bytes(overlay_uint8)
 
-    # 2. Mask (Colorized for viewing + raw label)
-    mask_rgb = np.zeros((224, 224, 3), dtype=np.uint8)
-    mask_rgb[mask == 1] = [239, 68, 68]
-    mask_rgb[mask == 2] = [16, 185, 129]
-    mask_rgb[mask == 3] = [59, 130, 246]
+    # 2. Mask
+    active_mask = high_res_mask if high_res_mask is not None else mask
+    h, w = active_mask.shape
+    fill_colors, _ = get_color_scheme(palette)
+
+    mask_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    for c, col in fill_colors.items():
+        mask_rgb[active_mask == c] = (col * 255).astype(np.uint8)
+
     mask_bytes = array_to_png_bytes(mask_rgb)
-    raw_mask_label_bytes = array_to_png_bytes(mask.astype(np.uint8))
+    raw_mask_label_bytes = array_to_png_bytes(active_mask.astype(np.uint8))
 
     # 3. Binary masks
-    lv_mask_bytes = array_to_png_bytes((mask == 1).astype(np.uint8) * 255)
-    myo_mask_bytes = array_to_png_bytes((mask == 2).astype(np.uint8) * 255)
-    rv_mask_bytes = array_to_png_bytes((mask == 3).astype(np.uint8) * 255)
+    # Class 1: RV, Class 2: MYO, Class 3: LV
+    rv_mask_bytes = array_to_png_bytes((active_mask == 1).astype(np.uint8) * 255)
+    myo_mask_bytes = array_to_png_bytes((active_mask == 2).astype(np.uint8) * 255)
+    lv_mask_bytes = array_to_png_bytes((active_mask == 3).astype(np.uint8) * 255)
 
     # 4. JSON report
     report_dict = {
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "resolution": f"{w}x{h}",
         "clinical_metrics": metrics,
         "classes": {
             0: "Background",
-            1: "Left Ventricle (LV)",
+            1: "Right Ventricle (RV)",
             2: "Myocardium (MYO)",
-            3: "Right Ventricle (RV)"
+            3: "Left Ventricle (LV)"
         }
     }
     report_json_bytes = json.dumps(report_dict, indent=2).encode("utf-8")
@@ -476,9 +650,9 @@ def generate_segmentation_package(raw_norm_224, mask, metrics, alpha=0.55):
     # 5. Pack into in-memory ZIP bundle
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("segmentation_overlay.png", overlay_bytes)
-        zf.writestr("segmentation_mask_color.png", mask_bytes)
-        zf.writestr("segmentation_mask_labels.png", raw_mask_label_bytes)
+        zf.writestr("segmentation_overlay_hd.png", overlay_bytes)
+        zf.writestr("segmentation_mask_color_hd.png", mask_bytes)
+        zf.writestr("segmentation_mask_labels_hd.png", raw_mask_label_bytes)
         zf.writestr("mask_left_ventricle.png", lv_mask_bytes)
         zf.writestr("mask_myocardium.png", myo_mask_bytes)
         zf.writestr("mask_right_ventricle.png", rv_mask_bytes)

@@ -53,8 +53,10 @@ async def segment_cmri(
     file: UploadFile = File(..., description="CMRI file (.dcm, .nii, .nii.gz, .png, .jpg)"),
     spacing_x: float = Form(1.4),
     spacing_y: float = Form(1.4),
-    alpha: float = Form(0.55),
-    slice_idx: Optional[int] = Form(None)
+    alpha: float = Form(0.52),
+    slice_idx: Optional[int] = Form(None),
+    high_res: bool = Form(True),
+    palette: str = Form("classic")
 ):
     """
     Upload a CMRI file, run segmentation inference, and return structured JSON
@@ -88,8 +90,22 @@ async def segment_cmri(
     sy = parsed["pixdim"][1] if parsed["pixdim"][1] > 0 else spacing_y
     metrics = model_utils.compute_clinical_metrics(mask, (sx, sy))
 
-    # Package output
-    pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics, alpha=alpha)
+    # Package output with High-Res if requested
+    if high_res:
+        hd = model_utils.create_high_res_color_overlay(
+            base_img_orig=raw_slice,
+            probs_224=probs,
+            alpha=alpha,
+            palette=palette
+        )
+        pkg = model_utils.generate_segmentation_package(
+            norm_img_224, mask, metrics, alpha=alpha,
+            high_res_overlay_uint8=hd["composite_uint8"],
+            high_res_mask=hd["mask_high"],
+            palette=palette
+        )
+    else:
+        pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics, alpha=alpha, palette=palette)
 
     return {
         "status": "success",
@@ -110,14 +126,14 @@ async def segment_cmri(
         },
         "classes": {
             "0": "Background",
-            "1": "Left Ventricle (LV)",
+            "1": "Right Ventricle (RV)",
             "2": "Myocardium (MYO)",
-            "3": "Right Ventricle (RV)"
+            "3": "Left Ventricle (LV)"
         }
     }
 
 @app.post("/api/segment/mask")
-async def get_raw_mask(file: UploadFile = File(...)):
+async def get_raw_mask(file: UploadFile = File(...), high_res: bool = Form(True)):
     """Returns the segmentation mask directly as an image/png."""
     if engine is None:
         raise HTTPException(status_code=503, detail="Inference engine not loaded.")
@@ -125,13 +141,17 @@ async def get_raw_mask(file: UploadFile = File(...)):
     parsed = model_utils.parse_cmri(contents, filename=file.filename)
     raw_slice = parsed["slices"][len(parsed["slices"]) // 2]
     input_tensor, norm_img_224 = model_utils.preprocess_medical_image(raw_slice)
-    mask, _ = model_utils.run_inference(engine, input_tensor)
+    mask, probs = model_utils.run_inference(engine, input_tensor)
     metrics = model_utils.compute_clinical_metrics(mask)
-    pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics)
+    if high_res:
+        hd = model_utils.create_high_res_color_overlay(base_img_orig=raw_slice, probs_224=probs)
+        pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics, high_res_overlay_uint8=hd["composite_uint8"], high_res_mask=hd["mask_high"])
+    else:
+        pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics)
     return Response(content=pkg["mask_bytes"], media_type="image/png")
 
 @app.post("/api/segment/overlay")
-async def get_raw_overlay(file: UploadFile = File(...), alpha: float = Form(0.55)):
+async def get_raw_overlay(file: UploadFile = File(...), alpha: float = Form(0.52), high_res: bool = Form(True)):
     """Returns the color-coded overlay directly as an image/png."""
     if engine is None:
         raise HTTPException(status_code=503, detail="Inference engine not loaded.")
@@ -139,13 +159,17 @@ async def get_raw_overlay(file: UploadFile = File(...), alpha: float = Form(0.55
     parsed = model_utils.parse_cmri(contents, filename=file.filename)
     raw_slice = parsed["slices"][len(parsed["slices"]) // 2]
     input_tensor, norm_img_224 = model_utils.preprocess_medical_image(raw_slice)
-    mask, _ = model_utils.run_inference(engine, input_tensor)
+    mask, probs = model_utils.run_inference(engine, input_tensor)
     metrics = model_utils.compute_clinical_metrics(mask)
-    pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics, alpha=alpha)
+    if high_res:
+        hd = model_utils.create_high_res_color_overlay(base_img_orig=raw_slice, probs_224=probs, alpha=alpha)
+        pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics, alpha=alpha, high_res_overlay_uint8=hd["composite_uint8"], high_res_mask=hd["mask_high"])
+    else:
+        pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics, alpha=alpha)
     return Response(content=pkg["overlay_bytes"], media_type="image/png")
 
 @app.post("/api/segment/zip")
-async def get_zip_bundle(file: UploadFile = File(...)):
+async def get_zip_bundle(file: UploadFile = File(...), high_res: bool = Form(True)):
     """Returns a complete in-memory ZIP package containing all masks and JSON report."""
     if engine is None:
         raise HTTPException(status_code=503, detail="Inference engine not loaded.")
@@ -153,9 +177,13 @@ async def get_zip_bundle(file: UploadFile = File(...)):
     parsed = model_utils.parse_cmri(contents, filename=file.filename)
     raw_slice = parsed["slices"][len(parsed["slices"]) // 2]
     input_tensor, norm_img_224 = model_utils.preprocess_medical_image(raw_slice)
-    mask, _ = model_utils.run_inference(engine, input_tensor)
+    mask, probs = model_utils.run_inference(engine, input_tensor)
     metrics = model_utils.compute_clinical_metrics(mask)
-    pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics)
+    if high_res:
+        hd = model_utils.create_high_res_color_overlay(base_img_orig=raw_slice, probs_224=probs)
+        pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics, high_res_overlay_uint8=hd["composite_uint8"], high_res_mask=hd["mask_high"])
+    else:
+        pkg = model_utils.generate_segmentation_package(norm_img_224, mask, metrics)
     return Response(
         content=pkg["zip_bytes"],
         media_type="application/zip",
