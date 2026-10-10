@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.tempmediaStorage/
+.user_uploaded/
+test_high_res_overlay.png
+patient_slice4_test.png
+patient_slice4_high_res_refined.png
